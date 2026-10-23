@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Book a room – Conference Room Booking</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Conference Room Booking</h1>
+    <div class="user"><span id="who"></span><button id="logout">Log out</button></div>
+  </header>
+  <main>
+    <div class="card">
+      <h2>Book a room</h2>
+      <div class="grid">
+        <div>
+          <label for="location">Location</label>
+          <select id="location"><option value="">Loading…</option></select>
+        </div>
+        <div>
+          <label for="room">Room</label>
+          <select id="room" disabled><option value="">Choose a location first</option></select>
+        </div>
+        <div>
+          <label for="date">Date</label>
+          <input id="date" type="date">
+        </div>
+        <div>
+          <label for="guests">Guests</label>
+          <input id="guests" type="number" min="1" value="1">
+        </div>
+      </div>
+      <p id="roomInfo" class="muted"></p>
+      <button id="quoteBtn" class="secondary">Get price</button>
+
+      <div id="quote" class="quote">
+        <dl>
+          <dt>Forecast</dt><dd id="qTemp"></dd>
+          <dt>Base price</dt><dd id="qBase"></dd>
+          <dt>Weather surcharge</dt><dd id="qSurcharge"></dd>
+          <dt>Total</dt><dd id="qTotal" class="total"></dd>
+        </dl>
+        <button id="bookBtn">Confirm booking</button>
+      </div>
+      <div id="msg" class="msg"></div>
+    </div>
+
+    <div class="card">
+      <h2>My bookings</h2>
+      <div id="bookings" class="muted">Loading…</div>
+    </div>
+  </main>
+
+  <script src="api.js"></script>
+  <script>
+    if (!Api.token()) window.location.href = "index.html";
+    const $ = (id) => document.getElementById(id);
+    const msg = $("msg");
+    let rooms = [];
+
+    $("who").textContent = (Api.user() || {}).name || "";
+    $("logout").onclick = Api.logout;
+    const today = new Date().toISOString().slice(0, 10);
+    $("date").min = today;
+    $("date").value = today;
+
+    async function loadLocations() {
+      const locations = await Api.call("GET", "/api/rooms/locations");
+      $("location").innerHTML = '<option value="">Choose a location</option>' +
+        locations.map((l) => `<option value="${l.locationId}">${l.name}</option>`).join("");
+    }
+
+    $("location").onchange = async () => {
+      hideQuote();
+      const id = $("location").value;
+      if (!id) { $("room").disabled = true; return; }
+      rooms = await Api.call("GET", `/api/rooms/locations/${id}/rooms`);
+      $("room").innerHTML = rooms.map((r) =>
+        `<option value="${r.roomId}">${r.name} (up to ${r.capacity})</option>`).join("");
+      $("room").disabled = false;
+      showRoomInfo();
+    };
+
+    function showRoomInfo() {
+      const r = rooms.find((x) => x.roomId === $("room").value);
+      $("roomInfo").textContent = r ? `Capacity ${r.capacity} guests · base price ${gbp(r.basePrice)} per day` : "";
+      $("guests").max = r ? r.capacity : "";
+    }
+
+    function hideQuote() { $("quote").className = "quote"; hideMsg(msg); }
+    $("room").onchange = () => { showRoomInfo(); hideQuote(); };
+    $("date").onchange = hideQuote;
+
+    $("quoteBtn").onclick = async () => {
+      hideQuote();
+      if (!$("room").value || !$("date").value) return showMsg(msg, "Choose a room and a date.", "error");
+      try {
+        const q = await Api.call("GET", `/api/bookings/quote?roomId=${$("room").value}&date=${$("date").value}`);
+        $("qTemp").textContent = `${q.temperature} °C in ${q.locationName} on ${q.date}`;
+        $("qBase").textContent = gbp(q.basePrice);
+        $("qSurcharge").textContent = `${Math.round(q.surchargeRate * 100)}% (${Math.abs(q.temperature - 20)} °C from 20 °C)`;
+        $("qTotal").textContent = gbp(q.finalPrice);
+        $("quote").className = "quote show";
+      } catch (err) { showMsg(msg, err.message, "error"); }
+    };
+
+    $("bookBtn").onclick = async () => {
+      try {
+        const b = await Api.call("POST", "/api/bookings", {
+          roomId: $("room").value, date: $("date").value, guests: Number($("guests").value),
+        });
+        $("quote").className = "quote";
+        showMsg(msg, `Booked ${b.roomName}, ${b.locationName} on ${b.date} for ${gbp(b.finalPrice)}.`, "ok");
+        loadBookings();
+      } catch (err) { showMsg(msg, err.message, "error"); }
+    };
+
+    async function loadBookings() {
+      const list = await Api.call("GET", "/api/bookings/me");
+      if (!list.length) { $("bookings").textContent = "You have no bookings yet."; return; }
+      $("bookings").innerHTML = `<table><thead><tr><th>Date</th><th>Location</th><th>Room</th>
+        <th>Guests</th><th>Forecast</th><th>Surcharge</th><th>Price</th></tr></thead><tbody>` +
+        list.map((b) => `<tr><td>${b.date}</td><td>${b.locationName}</td><td>${b.roomName}</td>
+          <td>${b.guests}</td><td>${b.temperature} °C</td><td>${Math.round(b.surchargeRate * 100)}%</td>
+          <td>${gbp(b.finalPrice)}</td></tr>`).join("") + "</tbody></table>";
+    }
+
+    loadLocations().catch((e) => showMsg(msg, e.message, "error"));
+    loadBookings().catch((e) => { $("bookings").textContent = e.message; });
+  </script>
+</body>
+</html>
