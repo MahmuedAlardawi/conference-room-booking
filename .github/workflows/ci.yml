@@ -1,4 +1,4 @@
-name: CI
+name: CI/CD
 
 on:
   push:
@@ -6,7 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  AWS_REGION: us-east-1
+  CLUSTER: crb-cluster
+
 jobs:
+  # ---------------- CI: runs on every push ----------------
   lint:
     name: Lint (flake8)
     runs-on: ubuntu-24.04
@@ -32,8 +37,7 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements-dev.txt
-      - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
       - name: Run tests with coverage gate (80%)
         working-directory: services/${{ matrix.service }}
         run: pytest -v --cov=. --cov-report=term --cov-fail-under=80
@@ -48,27 +52,139 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install pytest requests
-
       - name: Build and start full stack
         run: docker compose up -d --build
-
       - name: Wait for gateway
         run: |
           for i in $(seq 1 30); do
-            if curl -sf http://localhost:8080/api/bookings/health > /dev/null; then
-              echo "Stack is up"; exit 0
-            fi
+            curl -sf http://localhost:8080/api/bookings/health > /dev/null && { echo "Stack is up"; exit 0; }
             echo "Waiting... ($i)"; sleep 2
           done
           echo "Stack did not start"; exit 1
-
       - name: Run end-to-end tests
         run: pytest tests/e2e -v
-
       - name: Show logs on failure
         if: failure()
         run: docker compose logs
-
       - name: Stop stack
         if: always()
         run: docker compose down
+
+  # ---------------- CD: only on push to main ----------------
+  changes:
+    name: Detect changed services
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      services: ${{ steps.diff.outputs.services }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: diff
+        run: |
+          BEFORE="${{ github.event.before }}"
+          ALL="auth rooms weather booking frontend"
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BEFORE" 2>/dev/null; then
+            CHANGED="$ALL"
+          else
+            FILES=$(git diff --name-only "$BEFORE" "${{ github.sha }}")
+            echo "Changed files:"; echo "$FILES"
+            CHANGED=""
+            for s in auth rooms weather booking; do
+              echo "$FILES" | grep -q "^services/$s/" && CHANGED="$CHANGED $s"
+            done
+            echo "$FILES" | grep -q "^frontend/" && CHANGED="$CHANGED frontend"
+          fi
+          if [ -z "$(echo $CHANGED)" ]; then JSON='[]'; else JSON=$(printf '%s\n' $CHANGED | jq -R . | jq -cs .); fi
+          echo "Services to deploy: $JSON"
+          echo "services=$JSON" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy ${{ matrix.service }} to ECS
+    needs: [integration, changes]
+    if: needs.changes.outputs.services != '[]'
+    runs-on: ubuntu-24.04
+    environment: aws
+    concurrency: deploy-${{ matrix.service }}
+    strategy:
+      matrix:
+        service: ${{ fromJSON(needs.changes.outputs.services) }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build and push image to ECR
+        id: image
+        run: |
+          SVC=${{ matrix.service }}
+          ACCT=$(aws sts get-caller-identity --query Account --output text)
+          REG="$ACCT.dkr.ecr.$AWS_REGION.amazonaws.com"
+          IMAGE="$REG/crb-$SVC:${GITHUB_SHA::7}"
+          CONTEXT=$([ "$SVC" = "frontend" ] && echo frontend || echo services/$SVC)
+          aws ecr get-login-password | docker login --username AWS --password-stdin "$REG"
+          docker build --provenance=false -t "$IMAGE" -t "$REG/crb-$SVC:latest" "$CONTEXT"
+          docker push "$IMAGE"
+          docker push "$REG/crb-$SVC:latest"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Register new task definition
+        id: taskdef
+        run: |
+          aws ecs describe-task-definition --task-definition crb-${{ matrix.service }} --query taskDefinition \
+            | jq --arg IMG "${{ steps.image.outputs.image }}" \
+                 '.containerDefinitions[0].image = $IMG
+                  | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                        .compatibilities, .registeredAt, .registeredBy)' > td.json
+          ARN=$(aws ecs register-task-definition --cli-input-json file://td.json \
+                  --query taskDefinition.taskDefinitionArn --output text)
+          echo "New task definition: $ARN"
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Rolling update on ECS (zero downtime)
+        run: |
+          aws ecs update-service --cluster $CLUSTER --service crb-${{ matrix.service }} \
+            --task-definition ${{ steps.taskdef.outputs.arn }} > /dev/null
+          echo "Waiting for new tasks to pass ALB health checks..."
+          aws ecs wait services-stable --cluster $CLUSTER --services crb-${{ matrix.service }}
+
+      - name: Verify no automatic rollback
+        run: |
+          CURRENT=$(aws ecs describe-services --cluster $CLUSTER --services crb-${{ matrix.service }} \
+                      --query "services[0].taskDefinition" --output text)
+          echo "Running: $CURRENT"
+          if [ "$CURRENT" != "${{ steps.taskdef.outputs.arn }}" ]; then
+            echo "::error::Deployment failed health checks and was rolled back by the ECS circuit breaker"
+            exit 1
+          fi
+          echo "Deployed ${{ matrix.service }} -> ${{ steps.image.outputs.image }}"
+
+  smoke:
+    name: Smoke tests on AWS
+    needs: deploy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install pytest requests
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Run end-to-end tests against the ALB
+        run: |
+          export BASE_URL="http://$(aws elbv2 describe-load-balancers --names crb-alb \
+                              --query 'LoadBalancers[0].DNSName' --output text)"
+          echo "Testing $BASE_URL"
+          pytest tests/e2e -v
