@@ -50,3 +50,9 @@ services:
     ports: ["5001:5000"]
     depends_on:
       setup-db: { condition: service_completed_successfully }
+
+  booking:
+    build: ./services/booking
+    environment: *service-env
+    ports: ["5004:5000"]
+    depends_on: [rooms, weather]
