@@ -4,6 +4,8 @@ x-service-env: &service-env
   AWS_SECRET_ACCESS_KEY: local
   DYNAMODB_ENDPOINT: http://dynamodb:8000
   TABLE_PREFIX: crb-
+  ROOMS_URL: http://rooms:5000
+  WEATHER_URL: http://weather:5000
 
 services:
   dynamodb:
@@ -34,3 +36,9 @@ services:
     ports: ["5002:5000"]
     depends_on:
       setup-db: { condition: service_completed_successfully }
+
+  weather:
+    build: ./services/weather
+    environment: *service-env
+    ports: ["5003:5000"]
+    depends_on: [rooms]
