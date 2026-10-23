@@ -6,6 +6,7 @@ x-service-env: &service-env
   TABLE_PREFIX: crb-
   ROOMS_URL: http://rooms:5000
   WEATHER_URL: http://weather:5000
+  JWT_SECRET: local-dev-secret-key-at-least-32-bytes
 
 services:
   dynamodb:
@@ -42,3 +43,10 @@ services:
     environment: *service-env
     ports: ["5003:5000"]
     depends_on: [rooms]
+
+  auth:
+    build: ./services/auth
+    environment: *service-env
+    ports: ["5001:5000"]
+    depends_on:
+      setup-db: { condition: service_completed_successfully }
